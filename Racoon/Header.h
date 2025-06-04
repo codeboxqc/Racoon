@@ -92,8 +92,11 @@ struct VideoContext {
     SDL_AudioDeviceID audioDevice = 0;
     struct SwrContext* swrContext = nullptr;
 
-
     AVChannelLayout audioChannelLayout = { AV_CHANNEL_ORDER_UNSPEC, 0, { 0 }, nullptr };
+
+    uint64_t currentStreamPos = 0; // Tracks the current stream position
+
+    bool is_fullscreen = false; // Add this member to fix the error
 };
 
 extern "C" void audioCallback(void* userdata, uint8_t* stream, int len);
@@ -108,5 +111,3 @@ bool decodeNextAudioPacket(VideoContext& videoCtx);
 #endif
 
 // Standardized logging function
-
- 

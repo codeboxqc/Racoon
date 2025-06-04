@@ -2,7 +2,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_audio.h>
 #include <algorithm>
-#include <string> // For std::to_string in logging
+#include <string>
 
 #ifdef min
 #undef min
@@ -11,10 +11,8 @@
 extern "C" {
 #include <libswresample/swresample.h>
 #include <libavutil/channel_layout.h>
-#include <libavutil/error.h> // Added for av_make_error_string
+#include <libavutil/error.h>
 }
-
-// logError is now declared in Header.h and defined in Racoon.cpp
 
 bool initializeFFmpeg() {
     logError("FFmpeg initialized.");
@@ -45,6 +43,11 @@ bool openVideoFile(const char* filePath, VideoContext& videoCtx) {
         }
         else if (pCodecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (videoCtx.audioStreamIndex == -1) videoCtx.audioStreamIndex = i;
+        }
+
+        const AVCodec* pVideoCodec = avcodec_find_decoder_by_name("hevc_dxva2"); // Use DXVA2 for HEVC
+        if (!pVideoCodec) {
+            pVideoCodec = avcodec_find_decoder(pCodecParams->codec_id); // Use pCodecParams instead of pVideoCodecParams
         }
     }
 
@@ -107,6 +110,26 @@ bool openVideoFile(const char* filePath, VideoContext& videoCtx) {
                             static_cast<int>(pAudioCodecParams->ch_layout.nb_channels),
                             av_get_sample_fmt_name(static_cast<AVSampleFormat>(pAudioCodecParams->format)));
 
+                        // Initialize SDL Audio Device
+                        SDL_memset(&videoCtx.desiredAudioSpec, 0, sizeof(SDL_AudioSpec));
+                        videoCtx.desiredAudioSpec.freq = pAudioCodecParams->sample_rate;
+                        videoCtx.desiredAudioSpec.format = AUDIO_S16SYS;
+                        videoCtx.desiredAudioSpec.channels = 2; // Stereo
+                        videoCtx.desiredAudioSpec.samples = 8192; // Increased buffer size
+                        videoCtx.desiredAudioSpec.callback = audioCallback;
+                        videoCtx.desiredAudioSpec.userdata = &videoCtx;
+
+                        videoCtx.audioDevice = SDL_OpenAudioDevice(nullptr, 0, &videoCtx.desiredAudioSpec, &videoCtx.obtainedAudioSpec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
+                        if (videoCtx.audioDevice == 0) {
+                            logError("FFmpeg: WARN Failed to open SDL audio device: %s", SDL_GetError());
+                            avcodec_free_context(&videoCtx.audioCodecContext);
+                        }
+                        else {
+                            logError("FFmpeg: SDL audio device opened. Obtained: freq=%d, channels=%d, format=%d",
+                                videoCtx.obtainedAudioSpec.freq, videoCtx.obtainedAudioSpec.channels, videoCtx.obtainedAudioSpec.format);
+                            SDL_PauseAudioDevice(videoCtx.audioDevice, 0); // Start playback
+                        }
+
                         videoCtx.decodedAudioFrame = av_frame_alloc();
                         videoCtx.audioPacket = av_packet_alloc();
                         if (!videoCtx.decodedAudioFrame || !videoCtx.audioPacket) {
@@ -114,52 +137,99 @@ bool openVideoFile(const char* filePath, VideoContext& videoCtx) {
                             av_frame_free(&videoCtx.decodedAudioFrame);
                             av_packet_free(&videoCtx.audioPacket);
                             avcodec_free_context(&videoCtx.audioCodecContext);
+                            if (videoCtx.audioDevice) {
+                                SDL_CloseAudioDevice(videoCtx.audioDevice);
+                                videoCtx.audioDevice = 0;
+                            }
                         }
                         else {
-                            // Setup SwrContext for resampling to S16
-                            videoCtx.swrContext = swr_alloc();
-                            if (!videoCtx.swrContext) {
-                                logError("FFmpeg: WARN Cannot allocate SwrContext. Audio may not play.");
+                            // Allocate audio buffer
+                            videoCtx.audioBufferAllocatedSize = 8192 * videoCtx.obtainedAudioSpec.channels * 2; // 2 bytes per sample for S16
+                            videoCtx.audioBuffer = static_cast<uint8_t*>(av_malloc(videoCtx.audioBufferAllocatedSize));
+                            if (!videoCtx.audioBuffer) {
+                                logError("FFmpeg: WARN Failed to allocate audio buffer");
                                 av_frame_free(&videoCtx.decodedAudioFrame);
                                 av_packet_free(&videoCtx.audioPacket);
                                 avcodec_free_context(&videoCtx.audioCodecContext);
+                                if (videoCtx.audioDevice) {
+                                    SDL_CloseAudioDevice(videoCtx.audioDevice);
+                                    videoCtx.audioDevice = 0;
+                                }
                             }
                             else {
-                                AVChannelLayout out_ch_layout;
-                                av_channel_layout_copy(&out_ch_layout, &videoCtx.audioChannelLayout); // Default to input layout for output if not specified otherwise
-                                AVChannelLayout in_ch_layout;
-                                av_channel_layout_copy(&in_ch_layout, &videoCtx.audioChannelLayout);
+                                videoCtx.audioBufferSize = 0;
+                                videoCtx.audioBufferPos = 0;
 
-                                // Log SwrContext options
-                                logError("FFmpeg: SwrContext options: out_ch_layout channels: %d, out_sample_rate: %d, out_sample_fmt: %s, in_ch_layout channels: %d, in_sample_rate: %d, in_sample_fmt: %s",
-                                    out_ch_layout.nb_channels, pAudioCodecParams->sample_rate, av_get_sample_fmt_name(AV_SAMPLE_FMT_S16),
-                                    in_ch_layout.nb_channels, pAudioCodecParams->sample_rate, av_get_sample_fmt_name(static_cast<AVSampleFormat>(pAudioCodecParams->format)));
+                                // Check if resampling is needed
+                                bool needsResampling = pAudioCodecParams->format != AV_SAMPLE_FMT_S16 ||
+                                    pAudioCodecParams->ch_layout.nb_channels != videoCtx.obtainedAudioSpec.channels ||
+                                    pAudioCodecParams->sample_rate != videoCtx.obtainedAudioSpec.freq;
 
-                                // Set options for SwrContext
-                                av_opt_set_chlayout(videoCtx.swrContext, "out_channel_layout", &out_ch_layout, 0);
-                                av_opt_set_int(videoCtx.swrContext, "out_sample_rate", pAudioCodecParams->sample_rate, 0);
-                                av_opt_set_sample_fmt(videoCtx.swrContext, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-                                av_opt_set_chlayout(videoCtx.swrContext, "in_channel_layout", &in_ch_layout, 0);
-                                av_opt_set_int(videoCtx.swrContext, "in_sample_rate", pAudioCodecParams->sample_rate, 0);
-                                av_opt_set_sample_fmt(videoCtx.swrContext, "in_sample_fmt", static_cast<AVSampleFormat>(pAudioCodecParams->format), 0);
-
-                                int swr_init_ret = swr_init(videoCtx.swrContext);
-                                if (swr_init_ret < 0) {
-                                    char errBuf[AV_ERROR_MAX_STRING_SIZE];
-                                    av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, swr_init_ret);
-                                    logError("FFmpeg: WARN Cannot initialize SwrContext. Error: %s. Audio may not play.", errBuf);
-                                    swr_free(&videoCtx.swrContext);
-                                    av_frame_free(&videoCtx.decodedAudioFrame);
-                                    av_packet_free(&videoCtx.audioPacket);
-                                    avcodec_free_context(&videoCtx.audioCodecContext);
+                                if (!needsResampling) {
+                                    logError("FFmpeg: Audio format matches SDL spec (S16, %d channels, %d Hz). Skipping SwrContext.",
+                                        videoCtx.obtainedAudioSpec.channels, videoCtx.obtainedAudioSpec.freq);
                                 }
                                 else {
-                                    logError("FFmpeg: Audio SwrContext initialized for S16 conversion.");
-                                }
+                                    // Setup SwrContext for resampling to S16
+                                    videoCtx.swrContext = swr_alloc();
+                                    if (!videoCtx.swrContext) {
+                                        logError("FFmpeg: WARN Cannot allocate SwrContext. Audio may not play.");
+                                        av_frame_free(&videoCtx.decodedAudioFrame);
+                                        av_packet_free(&videoCtx.audioPacket);
+                                        avcodec_free_context(&videoCtx.audioCodecContext);
+                                        av_free(videoCtx.audioBuffer);
+                                        videoCtx.audioBuffer = nullptr;
+                                        if (videoCtx.audioDevice) {
+                                            SDL_CloseAudioDevice(videoCtx.audioDevice);
+                                            videoCtx.audioDevice = 0;
+                                        }
+                                    }
+                                    else {
+                                        AVChannelLayout in_ch_layout;
+                                        AVChannelLayout out_ch_layout;
+                                        av_channel_layout_copy(&in_ch_layout, &videoCtx.audioChannelLayout);
+                                        av_channel_layout_default(&out_ch_layout, videoCtx.obtainedAudioSpec.channels); // Use SDL channels
 
-                                // Clean up copied layouts
-                                av_channel_layout_uninit(&out_ch_layout);
-                                av_channel_layout_uninit(&in_ch_layout);
+                                        char in_layout_desc[128], out_layout_desc[128];
+                                        av_channel_layout_describe(&in_ch_layout, in_layout_desc, sizeof(in_layout_desc));
+                                        av_channel_layout_describe(&out_ch_layout, out_layout_desc, sizeof(out_layout_desc));
+                                        logError("FFmpeg: SwrContext options: in_ch_layout: %s (%d channels), in_sample_rate: %d, in_sample_fmt: %s, out_ch_layout: %s (%d channels), out_sample_rate: %d, out_sample_fmt: %s",
+                                            in_layout_desc, in_ch_layout.nb_channels, pAudioCodecParams->sample_rate, av_get_sample_fmt_name(static_cast<AVSampleFormat>(pAudioCodecParams->format)),
+                                            out_layout_desc, out_ch_layout.nb_channels, videoCtx.obtainedAudioSpec.freq, av_get_sample_fmt_name(AV_SAMPLE_FMT_S16));
+
+                                        // Set SwrContext options
+                                        swr_alloc_set_opts2(&videoCtx.swrContext,
+                                            &out_ch_layout, AV_SAMPLE_FMT_S16, videoCtx.obtainedAudioSpec.freq,
+                                            &in_ch_layout, static_cast<AVSampleFormat>(pAudioCodecParams->format), pAudioCodecParams->sample_rate,
+                                            0, nullptr);
+
+                                        int swr_init_ret = swr_init(videoCtx.swrContext);
+                                        if (swr_init_ret < 0) {
+                                            char errBuf[AV_ERROR_MAX_STRING_SIZE];
+                                            av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, swr_init_ret);
+                                            logError("FFmpeg: WARN Cannot initialize SwrContext. Error: %s. Audio may not play.", errBuf);
+                                            swr_free(&videoCtx.swrContext);
+                                            av_frame_free(&videoCtx.decodedAudioFrame);
+                                            av_packet_free(&videoCtx.audioPacket);
+                                            avcodec_free_context(&videoCtx.audioCodecContext);
+                                            av_free(videoCtx.audioBuffer);
+                                            videoCtx.audioBuffer = nullptr;
+                                            if (videoCtx.audioDevice) {
+                                                SDL_CloseAudioDevice(videoCtx.audioDevice);
+                                                videoCtx.audioDevice = 0;
+                                            }
+                                            av_channel_layout_uninit(&in_ch_layout);
+                                            av_channel_layout_uninit(&out_ch_layout);
+                                            return true; // Continue with video
+                                        }
+                                        else {
+                                            logError("FFmpeg: Audio SwrContext initialized for S16 conversion.");
+                                        }
+
+                                        av_channel_layout_uninit(&in_ch_layout);
+                                        av_channel_layout_uninit(&out_ch_layout);
+                                    }
+                                }
                             }
                         }
                     }
@@ -171,12 +241,12 @@ bool openVideoFile(const char* filePath, VideoContext& videoCtx) {
         }
     }
 
-    // 6. Initialize SwsContext for video frame conversion
+    // 6. Initialize SwsContext for video frame conversion with SWS_BICUBIC
     if (videoCtx.videoCodecContext) {
         videoCtx.swsContext = sws_getContext(
             videoCtx.videoCodecContext->width, videoCtx.videoCodecContext->height, videoCtx.videoCodecContext->pix_fmt,
             videoCtx.videoCodecContext->width, videoCtx.videoCodecContext->height, AV_PIX_FMT_RGBA,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
+            SWS_BICUBIC, nullptr, nullptr, nullptr);
         if (!videoCtx.swsContext) {
             logError("FFmpeg: ERROR Could not initialize SwsContext for video conversion.");
             closeVideoFile(videoCtx);
@@ -268,47 +338,41 @@ bool decodeNextAudioPacket(VideoContext& videoCtx) {
     int ret;
 
     while (true) {
-        // Try to receive a frame first, in case decoder has buffered data
         ret = avcodec_receive_frame(videoCtx.audioCodecContext, videoCtx.decodedAudioFrame);
-        if (ret == 0) { // Successfully got a frame
+        if (ret == 0) {
             logError("FFmpeg: Successfully received audio frame (prior to reading new packet).");
-            // Process this frame
         }
         else if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            // Need more data or end of stream from decoder, so read a new packet
             if (ret == AVERROR_EOF) {
                 logError("FFmpeg: avcodec_receive_frame returned AVERROR_EOF before reading new packet. Decoder fully flushed.");
-                // No need to unref packet here as it's not yet read or was processed.
-                return false; // Decoder is flushed and no more data.
+                return false;
             }
 
             logError("FFmpeg: avcodec_receive_frame returned EAGAIN. Attempting to read new packet.");
-            av_packet_unref(packet); // Ensure packet is clean before reading
+            av_packet_unref(packet);
             ret = av_read_frame(videoCtx.formatContext, packet);
             if (ret < 0) {
                 if (ret == AVERROR_EOF) {
                     logError("FFmpeg: av_read_frame reached EOF (audio). Sending NULL packet to flush decoder.");
-                    // Send a NULL packet to the decoder to flush remaining frames
                     ret = avcodec_send_packet(videoCtx.audioCodecContext, nullptr);
                     if (ret < 0) {
                         char errBuf[AV_ERROR_MAX_STRING_SIZE];
                         av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
                         logError("FFmpeg: Error sending NULL flush packet to audio decoder: %s (code %d)", errBuf, ret);
-                        return false; // Cannot flush.
+                        return false;
                     }
-                    // Now try to receive the flushed frames in the next iteration's avcodec_receive_frame
                     continue;
                 }
                 else {
                     char errBuf[AV_ERROR_MAX_STRING_SIZE];
                     av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
                     logError("FFmpeg: av_read_frame error (audio): %s (code %d)", errBuf, ret);
-                    return false; // Error reading frame
+                    return false;
                 }
             }
 
             if (packet->stream_index != videoCtx.audioStreamIndex) {
-                av_packet_unref(packet); // Not for us
+                av_packet_unref(packet);
                 continue;
             }
 
@@ -319,27 +383,23 @@ bool decodeNextAudioPacket(VideoContext& videoCtx) {
                 av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
                 logError("FFmpeg: Error sending audio packet to decoder: %s (code %d)", errBuf, ret);
                 av_packet_unref(packet);
-                if (ret == AVERROR(EAGAIN)) { // Should not happen if we just received EAGAIN from receive_frame
+                if (ret == AVERROR(EAGAIN)) {
                     logError("FFmpeg: avcodec_send_packet returned EAGAIN unexpectedly, continuing.");
                     continue;
                 }
-                return false; // Other error
+                return false;
             }
-            // Packet is now owned by decoder, try to receive frame again in next loop iteration
-            av_packet_unref(packet); // Decoder has it or copied it.
-            continue; // Go back to avcodec_receive_frame
-
+            av_packet_unref(packet);
+            continue;
         }
-        else { // Other avcodec_receive_frame error
+        else {
             char errBuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
             logError("FFmpeg: Error receiving audio frame from decoder: %s (code %d)", errBuf, ret);
-            // No packet to unref here as it's about receiving.
             return false;
         }
 
-        // Frame processing logic (moved from original position)
-        uint8_t* out_buffer_ptr[1] = { videoCtx.audioBuffer }; // swr_convert expects array of pointers
+        uint8_t* out_buffer_ptr[1] = { videoCtx.audioBuffer };
         int out_samples = 0;
 
         if (videoCtx.swrContext) {
@@ -349,16 +409,18 @@ bool decodeNextAudioPacket(VideoContext& videoCtx) {
                 videoCtx.decodedAudioFrame->ch_layout.nb_channels);
 
             int max_out_samples = av_rescale_rnd(videoCtx.decodedAudioFrame->nb_samples, videoCtx.obtainedAudioSpec.freq, videoCtx.decodedAudioFrame->sample_rate, AV_ROUND_UP);
-            uint32_t required_buffer_size = static_cast<uint32_t>(max_out_samples * videoCtx.obtainedAudioSpec.channels * 2); // 2 for S16
+            uint32_t required_buffer_size = static_cast<uint32_t>(max_out_samples * videoCtx.obtainedAudioSpec.channels * 2);
 
             if (videoCtx.audioBufferAllocatedSize < required_buffer_size) {
-                logError("FFmpeg: audioBuffer too small for resampled data. Need %u, have %u. This is a critical error.",
-                    required_buffer_size, videoCtx.audioBufferAllocatedSize);
-                // TODO: Consider reallocating audioBuffer here if this happens, though ideally initial allocation is sufficient.
-                // For now, just log and potentially fail or truncate.
-                // Returning false here might be too abrupt. Let's see if swr_convert handles smaller output buffer.
-                // It's better to ensure buffer is large enough initially.
-                // For this exercise, we assume initial allocation is now robust.
+                logError("FFmpeg: Reallocating audioBuffer. Old size: %u, New size: %u", videoCtx.audioBufferAllocatedSize, required_buffer_size);
+                av_free(videoCtx.audioBuffer);
+                videoCtx.audioBuffer = static_cast<uint8_t*>(av_malloc(required_buffer_size));
+                if (!videoCtx.audioBuffer) {
+                    logError("FFmpeg: Failed to reallocate audio buffer");
+                    videoCtx.audioBufferAllocatedSize = 0;
+                    return false;
+                }
+                videoCtx.audioBufferAllocatedSize = required_buffer_size;
             }
 
             out_samples = swr_convert(videoCtx.swrContext, out_buffer_ptr, max_out_samples,
@@ -368,150 +430,113 @@ bool decodeNextAudioPacket(VideoContext& videoCtx) {
                 char errBuf[AV_ERROR_MAX_STRING_SIZE];
                 av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, out_samples);
                 logError("FFmpeg: swr_convert error: %s (code %d)", errBuf, out_samples);
-                return false; // Error during conversion
+                return false;
             }
             videoCtx.audioBufferSize = out_samples * videoCtx.obtainedAudioSpec.channels * av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
             logError("FFmpeg: swr_convert output: %d samples, calculated audioBufferSize: %u", out_samples, videoCtx.audioBufferSize);
         }
-        else if (videoCtx.audioCodecContext->sample_fmt == AV_SAMPLE_FMT_S16 &&
-            videoCtx.audioCodecContext->ch_layout.nb_channels == videoCtx.obtainedAudioSpec.channels &&
-            videoCtx.audioCodecContext->sample_rate == videoCtx.obtainedAudioSpec.freq) {
-            // Direct copy if format, channels, and sample rate match
-            int data_size = av_samples_get_buffer_size(nullptr, videoCtx.audioCodecContext->ch_layout.nb_channels,
-                videoCtx.decodedAudioFrame->nb_samples, videoCtx.audioCodecContext->sample_fmt, 1); // Align to 1 byte
-            logError("FFmpeg: Using direct memcpy for S16 audio (format, channels, rate match). Calculated data_size: %d. Frame samples: %d, Frame channels: %d, Frame format: %s",
-                data_size, videoCtx.decodedAudioFrame->nb_samples, videoCtx.audioCodecContext->ch_layout.nb_channels, av_get_sample_fmt_name(videoCtx.audioCodecContext->sample_fmt));
+        else {
+            int data_size = av_samples_get_buffer_size(nullptr, videoCtx.decodedAudioFrame->ch_layout.nb_channels,
+                videoCtx.decodedAudioFrame->nb_samples, static_cast<AVSampleFormat>(videoCtx.decodedAudioFrame->format), 1);
+            logError("FFmpeg: Direct copy attempt. Calculated data_size: %d, channels: %d, samples: %d, format: %s",
+                data_size, videoCtx.decodedAudioFrame->ch_layout.nb_channels, videoCtx.decodedAudioFrame->nb_samples,
+                av_get_sample_fmt_name(static_cast<AVSampleFormat>(videoCtx.decodedAudioFrame->format)));
 
-            if (data_size > 0 && static_cast<uint32_t>(data_size) <= videoCtx.audioBufferAllocatedSize) {
+            if (data_size > 0 && static_cast<uint32_t>(data_size) <= videoCtx.audioBufferAllocatedSize &&
+                videoCtx.decodedAudioFrame->format == AV_SAMPLE_FMT_S16 &&
+                videoCtx.decodedAudioFrame->ch_layout.nb_channels == videoCtx.obtainedAudioSpec.channels &&
+                videoCtx.decodedAudioFrame->sample_rate == videoCtx.obtainedAudioSpec.freq) {
                 memcpy(videoCtx.audioBuffer, videoCtx.decodedAudioFrame->data[0], data_size);
                 videoCtx.audioBufferSize = data_size;
             }
-            else if (data_size > 0) { // data_size > allocated size
-                logError("FFmpeg: audioBuffer too small for decoded data (S16 direct, matching spec). Need %d, have %u. Truncating.", data_size, videoCtx.audioBufferAllocatedSize);
-                memcpy(videoCtx.audioBuffer, videoCtx.decodedAudioFrame->data[0], videoCtx.audioBufferAllocatedSize);
-                videoCtx.audioBufferSize = videoCtx.audioBufferAllocatedSize;
-            }
             else {
-                logError("FFmpeg: Calculated data_size for direct S16 copy is %d. Setting audioBufferSize to 0.", data_size);
+                logError("FFmpeg: Cannot copy audio directly. Format mismatch or buffer too small. Decoded: format=%s, channels=%d, rate=%d. SDL: format=AUDIO_S16SYS, channels=%d, rate=%d",
+                    av_get_sample_fmt_name(static_cast<AVSampleFormat>(videoCtx.decodedAudioFrame->format)),
+                    videoCtx.decodedAudioFrame->ch_layout.nb_channels, videoCtx.decodedAudioFrame->sample_rate,
+                    videoCtx.obtainedAudioSpec.channels, videoCtx.obtainedAudioSpec.freq);
                 videoCtx.audioBufferSize = 0;
             }
         }
-        else {
-            logError("FFmpeg: CRITICAL WARNING: Audio format mismatch and no swrContext, or S16 spec mismatch. CANNOT PLAY AUDIO. Decoded Format: %s, Rate: %d, Channels: %d. Obtained Spec: Format AUDIO_S16SYS, Rate: %d, Channels: %d",
-                av_get_sample_fmt_name(static_cast<AVSampleFormat>(videoCtx.decodedAudioFrame->format)), videoCtx.decodedAudioFrame->sample_rate, videoCtx.decodedAudioFrame->ch_layout.nb_channels,
-                videoCtx.obtainedAudioSpec.freq, videoCtx.obtainedAudioSpec.channels);
-            videoCtx.audioBufferSize = 0; // No data to play
-        }
 
         videoCtx.audioBufferPos = 0;
-        av_frame_unref(videoCtx.decodedAudioFrame); // Unref the frame after processing
+        av_frame_unref(videoCtx.decodedAudioFrame);
         logError("FFmpeg: decodeNextAudioPacket returning true (successfully decoded and processed a frame). audioBufferSize: %u", videoCtx.audioBufferSize);
-        return true; // Successfully processed a frame
+        return true;
     }
-    // Should not be reached if loop logic is correct (either returns true with data, false on EOF/error)
     logError("FFmpeg: decodeNextAudioPacket returning false (exited loop unexpectedly).");
     return false;
 }
 
+ 
 
-extern "C" void audioCallback(void* userdata, uint8_t* stream, int len) {
-    VideoContext* videoCtx = static_cast<VideoContext*>(userdata);
-    logError("FFmpeg: audioCallback entered. Requested len: %d. Current audioBufferPos: %u, audioBufferSize: %u",
-        len, videoCtx ? videoCtx->audioBufferPos : -1, videoCtx ? videoCtx->audioBufferSize : -1);
+void toggle_fullscreen(VideoContext& videoCtx, SDL_Window* window, SDL_Renderer* renderer) {
+    videoCtx.is_fullscreen = !videoCtx.is_fullscreen;
+    Uint32 flags = videoCtx.is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+    SDL_SetWindowFullscreen(window, flags);
 
-    SDL_memset(stream, 0, len); // Clear the stream buffer first
+    int screen_width = 0; // Declare screen_width
+    int screen_height = 0; // Declare screenHeight
 
-    if (!videoCtx || !videoCtx->audioDevice || videoCtx->audioBufferAllocatedSize == 0 || !videoCtx->audioBuffer) {
-        logError("FFmpeg: audioCallback returning early: context/device/buffer invalid. videoCtx: %p, audioDevice: %u, allocatedSize: %u, audioBuffer: %p",
-            (void*)videoCtx, videoCtx ? videoCtx->audioDevice : 0, videoCtx ? videoCtx->audioBufferAllocatedSize : 0, videoCtx ? (void*)videoCtx->audioBuffer : (void*)nullptr);
-        return;
+    SDL_GetWindowSize(window, &screen_width, &screen_height);
+
+    float aspect_ratio = (float)videoCtx.videoCodecContext->width / videoCtx.videoCodecContext->height;
+    int render_width = screen_width;
+    int render_height = (int)(screen_width / aspect_ratio);
+
+    if (render_height > screen_height) {
+        render_height = screen_height;
+        render_width = (int)(screen_height * aspect_ratio);
     }
 
-    uint32_t amountToCopy;
-    int currentStreamPos = 0; // How much we've written to `stream` (use int to match len)
-
-    while (currentStreamPos < len) { // While there's still space in `stream` to fill
-        if (videoCtx->audioBufferPos >= videoCtx->audioBufferSize) {
-            logError("FFmpeg: audioCallback needs more data (bufferPos %u >= bufferSize %u). Calling decodeNextAudioPacket.",
-                videoCtx->audioBufferPos, videoCtx->audioBufferSize);
-
-            // Reset buffer position and size before decoding new packet
-            videoCtx->audioBufferPos = 0;
-            videoCtx->audioBufferSize = 0;
-
-            if (!decodeNextAudioPacket(*videoCtx)) {
-                logError("FFmpeg: audioCallback: decodeNextAudioPacket failed or returned EOF/no data. No more audio data to provide for this request. Stream pos: %d, requested len: %d", currentStreamPos, len);
-                // No more data to provide, the rest of `stream` will remain silent (already memset to 0)
-                return;
-            }
-            if (videoCtx->audioBufferSize == 0) {
-                logError("FFmpeg: audioCallback: decodeNextAudioPacket succeeded but returned 0 bufferSize. No audio data. Stream pos: %d, requested len: %d", currentStreamPos, len);
-                return; // No data decoded
-            }
-            logError("FFmpeg: audioCallback: decodeNextAudioPacket provided new data. New bufferSize: %u. audioBufferPos is %u.", videoCtx->audioBufferSize, videoCtx->audioBufferPos);
-        }
-
-        amountToCopy = std::min(static_cast<uint32_t>(len - currentStreamPos), videoCtx->audioBufferSize - videoCtx->audioBufferPos);
-
-        if (amountToCopy == 0 && (videoCtx->audioBufferSize - videoCtx->audioBufferPos > 0)) {
-            logError("FFmpeg: audioCallback: amountToCopy is 0, but data available in buffer (%u). This implies len - currentStreamPos is 0. Breaking.", videoCtx->audioBufferSize - videoCtx->audioBufferPos);
-            break;
-        }
-        if (amountToCopy == 0 && (videoCtx->audioBufferSize - videoCtx->audioBufferPos == 0)) {
-            logError("FFmpeg: audioCallback: amountToCopy is 0 and internal buffer is also consumed. Will try to decode next packet.");
-            // This state should be caught by the (videoCtx->audioBufferPos >= videoCtx->audioBufferSize) check at the loop start.
-            // If we are here, it means the previous decodeNextAudioPacket might have returned 0 useful bytes.
-            // Forcing a re-evaluation or exiting:
-            if (videoCtx->audioBufferPos >= videoCtx->audioBufferSize) continue; // Try to decode again.
-            else break; // Should not happen.
-        }
-
-
-        logError("FFmpeg: audioCallback: Before SDL_memcpy - amountToCopy: %u, audioBufferPos: %u, audioBufferSize: %u, currentStreamPos: %d",
-            amountToCopy, videoCtx->audioBufferPos, videoCtx->audioBufferSize, currentStreamPos);
-
-        if (videoCtx->audioBuffer + videoCtx->audioBufferPos == nullptr) {
-            logError("FFmpeg: audioCallback: CRITICAL: videoCtx->audioBuffer + videoCtx->audioBufferPos is NULL before memcpy!");
-            return;
-        }
-        if (stream + currentStreamPos == nullptr) {
-            logError("FFmpeg: audioCallback: CRITICAL: stream + currentStreamPos is NULL before memcpy!");
-            return;
-        }
-
-
-        SDL_memcpy(stream + currentStreamPos, videoCtx->audioBuffer + videoCtx->audioBufferPos, amountToCopy);
-
-        videoCtx->audioBufferPos += amountToCopy;
-        currentStreamPos += amountToCopy;
-
-        logError("FFmpeg: audioCallback: After SDL_memcpy - new audioBufferPos: %u, currentStreamPos: %u, remaining in stream: %d",
-            videoCtx->audioBufferPos, currentStreamPos, len - currentStreamPos);
-    }
-    logError("FFmpeg: audioCallback exiting. Filled stream. Total copied: %d", currentStreamPos);
+    SDL_Rect dst_rect = { (screen_width - render_width) / 2, (screen_height - render_height) / 2, render_width, render_height };
+    SDL_RenderSetViewport(renderer, &dst_rect); // Corrected function
+    logError("SDL: Toggled fullscreen: %s=%s, viewport x=%d, y=%d, w=%d, h=%d",
+        videoCtx.is_fullscreen ? "true" : "false", dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h);
 }
 
 bool decodeVideoFrame(VideoContext& videoCtx, SDL_Texture** videoTexture, SDL_Renderer* renderer) {
     if (!videoCtx.formatContext || !videoCtx.videoCodecContext || !videoCtx.swsContext) {
+        logError("FFmpeg: Invalid video context for decoding.");
         return false;
     }
 
-    AVPacket packet;
-    packet.data = nullptr;
-    packet.size = 0;
+    AVPacket* packet = av_packet_alloc();
+    if (!packet) {
+        logError("FFmpeg: Failed to allocate AVPacket.");
+        return false;
+    }
 
-    while (av_read_frame(videoCtx.formatContext, &packet) >= 0) {
-        if (packet.stream_index == videoCtx.videoStreamIndex) {
-            int ret = avcodec_send_packet(videoCtx.videoCodecContext, &packet);
-            if (ret < 0) {
-                char errBuf[AV_ERROR_MAX_STRING_SIZE];
-                av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
-                logError("FFmpeg: Error sending video packet to decoder: %s", errBuf);
-                av_packet_unref(&packet);
-                return false;
+    while (av_read_frame(videoCtx.formatContext, packet) >= 0) {
+        if (packet->stream_index == videoCtx.videoStreamIndex) {
+            int retries = 0;
+            const int max_retries = 10;
+            while (retries < max_retries) {
+                int ret = avcodec_send_packet(videoCtx.videoCodecContext, packet);
+                if (ret == 0) {
+                    break; // Packet sent successfully
+                }
+                else if (ret == AVERROR(EAGAIN)) {
+                    logError("FFmpeg: Video decoder busy, retrying (%d/%d).", retries + 1, max_retries);
+                    SDL_Delay(5); // Increased delay to 5ms
+                    retries++;
+                    continue;
+                }
+                else {
+                    char errBuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
+                    logError("FFmpeg: Error sending video packet to decoder: %s", errBuf);
+                    av_packet_unref(packet);
+                    av_packet_free(&packet);
+                    return false;
+                }
+            }
+            if (retries >= max_retries) {
+                logError("FFmpeg: Video decoder busy after %d retries, skipping packet.", max_retries);
+                av_packet_unref(packet);
+                continue;
             }
 
-            ret = avcodec_receive_frame(videoCtx.videoCodecContext, videoCtx.decodedFrame);
+            int ret = avcodec_receive_frame(videoCtx.videoCodecContext, videoCtx.decodedFrame);
             if (ret == 0) {
                 sws_scale(videoCtx.swsContext,
                     (const uint8_t* const*)videoCtx.decodedFrame->data, videoCtx.decodedFrame->linesize,
@@ -532,7 +557,8 @@ bool decodeVideoFrame(VideoContext& videoCtx, SDL_Texture** videoTexture, SDL_Re
                             videoCtx.videoCodecContext->height);
                         if (!*videoTexture) {
                             logError("FFmpeg: Failed to create SDL_Texture for video: %s", SDL_GetError());
-                            av_packet_unref(&packet);
+                            av_packet_unref(packet);
+                            av_packet_free(&packet);
                             return false;
                         }
                     }
@@ -541,28 +567,110 @@ bool decodeVideoFrame(VideoContext& videoCtx, SDL_Texture** videoTexture, SDL_Re
                         logError("FFmpeg: Failed to update SDL_Texture for video: %s", SDL_GetError());
                     }
                 }
-                av_packet_unref(&packet);
+                av_packet_unref(packet);
+                av_packet_free(&packet);
                 return true;
             }
             else if (ret == AVERROR(EAGAIN)) {
-                av_packet_unref(&packet);
+                av_packet_unref(packet);
                 continue;
             }
             else if (ret == AVERROR_EOF) {
                 logError("FFmpeg: Video decoder flushed, EOF reached.");
-                av_packet_unref(&packet);
+                av_packet_unref(packet);
+                av_packet_free(&packet);
                 return false;
             }
             else {
                 char errBuf[AV_ERROR_MAX_STRING_SIZE];
                 av_make_error_string(errBuf, AV_ERROR_MAX_STRING_SIZE, ret);
                 logError("FFmpeg: Error receiving video frame from decoder: %s", errBuf);
-                av_packet_unref(&packet);
+                av_packet_unref(packet);
+                av_packet_free(&packet);
                 return false;
             }
         }
-        av_packet_unref(&packet);
+        av_packet_unref(packet);
     }
 
+    av_packet_free(&packet);
     return false;
 }
+
+
+
+
+
+
+    extern "C" void audioCallback(void* userdata, uint8_t * stream, int len) {
+        VideoContext* videoCtx = static_cast<VideoContext*>(userdata);
+        logError("FFmpeg: audioCallback entered. Requested len: %d, Current audioBufferPos: %u, audioBufferSize: %u",
+            len, videoCtx ? videoCtx->audioBufferPos : -1, videoCtx ? videoCtx->audioBufferSize : -1);
+
+        SDL_memset(stream, 0, len);
+
+        if (!videoCtx || !videoCtx->audioDevice || videoCtx->audioBufferAllocatedSize == 0 || !videoCtx->audioBuffer) {
+            logError("FFmpeg: audioCallback returning early: context/device/buffer invalid. videoCtx: %p, audioDevice: %u, allocatedSize: %u, audioBuffer: %p",
+                (void*)videoCtx,
+                videoCtx ? videoCtx->audioDevice : 0,
+                videoCtx ? videoCtx->audioBufferAllocatedSize : 0,
+                videoCtx ? (void*)videoCtx->audioBuffer : (void*)nullptr);
+            return;
+        }
+
+        uint32_t amountToCopy;
+        int currentStreamPos = 0;
+
+        while (currentStreamPos < len) {
+            if (videoCtx->audioBufferPos >= videoCtx->audioBufferSize) {
+                logError("FFmpeg: audioCallback needs more audio data (bufferPos %u >= bufferSize %u). Calling decodeNextAudioPacket.",
+                    videoCtx->audioBufferPos, videoCtx->audioBufferSize);
+
+                videoCtx->audioBufferPos = 0;
+                videoCtx->audioBufferSize = 0;
+
+                if (!decodeNextAudioPacket(*videoCtx)) {
+                    logError("FFmpeg: audioCallback: decodeNextAudioPacket failed or returned EOF/no data. No more audio data to provide for this request. Stream pos: %d, requested len: %d", currentStreamPos, len);
+                    return;
+                }
+                if (videoCtx->audioBufferSize == 0) {
+                    logError("FFmpeg: audioCallback: decodeNextAudioPacket succeeded but returned 0 bufferSize. No audio data. Stream pos: %d, requested len: %d", currentStreamPos, len);
+                    return;
+                }
+                logError("FFmpeg: audioCallback: decodeNextAudioPacket provided new data. New bufferSize: %u, audioBufferPos is %u.", videoCtx->audioBufferSize, videoCtx->audioBufferPos);
+            }
+
+            amountToCopy = std::min(static_cast<uint32_t>(len - currentStreamPos), videoCtx->audioBufferSize - videoCtx->audioBufferPos);
+
+            if (amountToCopy == 0 && (videoCtx->audioBufferSize - videoCtx->audioBufferPos > 0)) {
+                logError("FFmpeg error: audioCallback: amountToCopy is 0 but data available in buffer (%u). This implies len - currentStreamPos is 0. Breaking.", videoCtx->audioBufferSize - videoCtx->audioBufferPos);
+                break;
+            }
+            if (amountToCopy == 0 && (videoCtx->audioBufferSize - videoCtx->audioBufferPos == 0)) {
+                logError("FFmpeg error: audioCallback: amountToCopy is 0 and internal buffer is also consumed. Will try to decode next audio packet.");
+                if (videoCtx->audioBufferPos >= videoCtx->audioBufferSize) continue;
+                else break;
+            }
+
+            logError("FFmpeg: audioCallback: Before SDL_memcpy - amountToCopy: %u, audioBufferPos: %u, audioBufferSize: %u, debugPos: %d",
+                amountToCopy, videoCtx->audioBufferPos, videoCtx->audioBufferSize, currentStreamPos);
+
+            if (videoCtx->audioBuffer + videoCtx->audioBufferPos == nullptr) {
+                logError("FFmpeg error: Failed to critical FFmpeg error: videoCtx->audioBuffer + videoCtx->bufferPos is NULL before memcpy!");
+                return;
+            }
+            if (stream + currentStreamPos == nullptr) {
+                logError("FFmpeg error: Failed to FFmpeg error: critical: stream + currentStreamPos is NULL before memcpy!");
+                return;
+            }
+
+            SDL_memcpy(stream + currentStreamPos, videoCtx->audioBuffer + videoCtx->audioBufferPos, amountToCopy);
+
+            videoCtx->audioBufferPos += amountToCopy;
+            currentStreamPos += amountToCopy;
+            logError("FFmpeg: audioCallback: After SDL_memcpy - new audioBufferPos: %u, currentStreamPos: %d, requested len: %d, remaining in stream: %d",
+                videoCtx->audioBufferPos, currentStreamPos, len, len - currentStreamPos);
+        }
+
+        logError("FFmpeg: audioCallback exiting. Filled audio stream successfully. Total copied: %d", currentStreamPos);
+    }
